@@ -1,0 +1,292 @@
+---
+title: "Recommender Using Last.fm API"
+author: "Aaron Grzasko"
+date: "December 18, 2016"
+output: 
+    html_document:
+        theme: simplex
+        highlight: haddock
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+  
+## Overview  
+  
+
+## Load Libraries  
+  
+Note:  The package `RLastFM` must be manually downloaded and installed. Scripts are provided below to carryout this procedure.   
+```{r, eval=TRUE, message=FALSE, warning=FALSE}
+if (!require(XML)) {install.packages('XML');require(XML)}
+if (!require(RCurl)) {install.packages('RCurl');require(RCurl)}
+if (!require(knitr)) {install.packages('knitr');require(knitr)}
+if (!require(recommenderlab)) {install.packages('recommenderlab');require(recommenderlab)}
+if (!require(jsonlite)) {install.packages('jsonlite');require(jsonlite)}
+if (!require(dplyr)) {install.packages('dplyr');require(dplyr)}
+if (!require(tidyr)) {install.packages('tidyr');require(tidyr)}
+if (!require(RMySQL)) {install.packages('RMySQL');require(RMySQL)}
+if (!require(getPass)) {install.packages('getPass');require(getPass)}
+
+# manual install of RLastFM package
+if (!require(RLastFM)) {
+    download.file('http://cran.r-project.org/src/contrib/Archive/RLastFM/RLastFM_0.1-5.tar.gz','RLastFM_0.1-5.tar.gz')
+    install.packages('RLastFM_0.1-5.tar.gz', repos = NULL, type = "source")
+    require(RLastFM)
+}
+
+
+```
+
+## Wrangle Raw Last.fm Data 
+  
+**RLastFM and API Notes**  
+In this section, I retrieve relevant Last.fm data using functions from the `RLastFM` package, where possible.  The `RLastFM` library was built to connect with a previous build of the Last.fm API; so some of the package functions no longer work.  Also, the current build of the Last.fm API has new methods that cannot be accessed using `RLastFM` functions.  Finally, the available functions in this package often do not allow the user full access to optional API method parameters.  For these reasons, I sometimes resort to manually-constructed functions to access the API data.   
+
+**Last.fm User data**  
+In the prior build of the Last.fm API, there was an available method to retrieve Last.fm usernames associated with a particular artist.  Unfortunately, this method is no longer available.  To generate a list of usernames, I visited the [Last.fm artist webpage](http://www.last.fm/music/Andy+Shauf) for a musician that I currently follow, Andy Shauf.  The artist's page lists the usernames of top listeners.  Using one of these usernames, I gnerated the user's friend list using a currently available API method.  Then, using a series of loops, I was able to retrieve additional friend lists.  In a series of only 50 loops, I was able to produce over 1800 unique usernames.   
+
+```{r, eval=FALSE}
+
+# api key
+my_key <- "1ba315d4d1673bbf88aed473f1917306"
+
+# seed user name, based on manual review of artist, Andy Shauf's Last.fm webpage.
+user_nm <- c("nellsie")
+
+# function to append unique user names to maste vector.  This function implements the 
+# user.getFriends() method from RLastFM package. 
+ 
+append_friends <- function (x,y){
+    friends <- user.getFriends(x,key=my_key)$username
+    for (i in friends){
+        if (!(i %in% y)){
+            y <- append(y,i)
+        }
+    }
+    return(y)
+}
+
+# loop through friends, friends of friends, etc.
+for (i in 1:50){
+    user_nm <- append_friends(user_nm[i],user_nm)
+    Sys.sleep(0.2)
+}
+
+# create user data frame with unique user_id 
+user_id <- seq(1:length(user_nm))
+user_df <- data.frame(cbind(user_id,user_nm),stringsAsFactors=FALSE)
+```
+  
+Now, pull in relevant user demographics, and merge with prior user data frame.  
+
+```{r, eval=FALSE}
+
+# getInfo() function; not available in RLastFM package
+user.getInfo <- function(user, key=my_key){
+    base_url <- "http://ws.audioscrobbler.com/2.0/?method="
+    method <- "user.getinfo"
+    user_string <- "&user="
+    key_string <- "&api_key="
+    format_string <- "&format=json"
+    return (fromJSON(paste0(base_url,method, user_string,user,key_string,key,format_string)))
+}
+# data frame of demo data for all users
+demo_data <- data.frame(user_nm=character(),country = character(), ct = integer())
+for (name in user_df$user_nm){
+    temp <- user.getInfo(name)
+    temp_nm <- user_df$user_nm[which(user_df$user_nm==name)]
+    temp_country <- temp$user$country
+    temp_ct <- temp$user$playcount
+    temp_col <- cbind(user_nm = temp_nm,country=temp_country, ct = temp_ct)
+    demo_data <- rbind(demo_data, temp_col)
+    Sys.sleep(0.2)
+}
+
+# merge demo data with initial user data frame
+user_df <- inner_join(user_df,demo_data, by="user_nm")
+
+# make sure all user names are UTF-8 compliant
+user_df$user_nm <- iconv(user_df$user_nm, "UTF-8", sub='')
+
+```
+**Artist Data**  
+  
+```{r, eval=FALSE}
+# function to retrive users' top artists
+# Using custom function rather than RLastFM functon to obtain more refined results
+
+user.getTopArtistsMod <- function(user, key=my_key, period="12month", limit=100, page=1){
+    base_url <- "http://ws.audioscrobbler.com/2.0/?method="
+    method <- "user.gettopartists"
+    user_string <- "&user="
+    key_string <- "&api_key="
+    format_string <- "&format=json"
+    period_string <- "&period="
+    limit_string <- "&limit="
+    page_string <- "&page="
+    return (fromJSON(paste0(base_url,method, user_string,user,key_string,key,format_string,
+                            period_string, period,limit_string,limit,page_string,page)))
+} 
+
+# obtain user/top artist combinations
+user_artist <- data.frame(name = character(), playcount = integer(),mbid= character(), user_id = integer())
+for (name in user_df$user_nm){
+    temp <- user.getTopArtistsMod(name)$topartists$artist[c("name","playcount","mbid")]
+    temp$user_id <- user_df$user_id[user_df$user_nm == name]
+    user_artist <- rbind(user_artist,temp)
+    Sys.sleep(0.2)
+}
+
+
+# artists data frame
+artists <- unique(user_artist[c("name","mbid")])
+artist_id <- seq(1:nrow(artists)) 
+artists <- cbind(artists, artist_id)
+artists <- subset(artists,select=c(artist_id,name,mbid))
+
+# clean up user_artist dataframe for database export
+user_artist <-inner_join(user_artist, artists, by="name")
+user_artist <- subset(user_artist, select=c(user_id,artist_id,playcount))
+
+# Make sure all artist names are UTF-8
+artists$name <- iconv(artists$name, "UTF-8", sub='')
+
+```
+
+
+**Tag Data**  
+  
+```{r, eval=FALSE}
+# artist/tag combination data frame
+artist_tag <- data.frame(artist_id = integer(),tag = character(),count = integer() )
+
+
+# part 1: populate artist_tags data frame by matching on unique artist mbid (musicbrainz id), where available
+for (i in 1:nrow(artists)){
+    if (artists[i,]$mbid != ""){
+        temp <- tryCatch(artist.getTopTags(artist=NA, mbid=artists[i,]$mbid),error=function(e) NULL)
+        temp_tag <- temp$tag
+        temp_ct <- temp$count
+        temp_id <- rep(artists[i,]$artist_id,length(temp_tag))
+        temp_col <- data.frame( artist_id= temp_id, tag=temp_tag,count=temp_ct)
+        artist_tag <- rbind(temp_col, artist_tag)
+        Sys.sleep(0.2)
+    }
+    
+}   
+# unique artist_ids from part 1
+artist_unq <- unique(artist_tag$artist_id)
+
+# part 2: populate artist_tags by matching on artist name if no mbid or no match from previous step
+for (i in 1:nrow(artists)){
+    if (!(artists[i,]$artist_id %in% artist_unq)){
+        temp <- tryCatch(artist.getTopTags(artist=artists[i,]$name),error=function(e) NULL)
+        temp_tag <- temp$tag
+        temp_ct <- temp$count
+        temp_id <- rep(artists[i,]$artist_id,length(temp_tag))
+        temp_col <- data.frame( artist_id= temp_id, tag=temp_tag,count=temp_ct)
+        artist_tag <- rbind(temp_col, artist_tag)
+        Sys.sleep(0.2)
+    }
+    
+}   
+
+# clean up artist_tag table
+artist_tag$tag <- tolower(artist_tag$tag)
+artist_tag <- artist_tag %>%
+        group_by(artist_id,tag) %>%
+        summarise(count = sum(count))
+artist_tag <- data.frame(artist_tag)
+
+# unique tags data frame
+tags <- artist_tag %>%
+        group_by(tag) %>%
+        summarise(count = sum(count))
+tag_id <- seq(1:nrow(tags))
+tags$tag_id <- tag_id
+tags <- subset(tags, select=c(tag_id,tag,count)) 
+tags <- data.frame(tags)
+
+# prepare artist_tags data frame for database export
+artist_tag <- inner_join(artist_tag,tags, by="tag")
+artist_tag <- subset(artist_tag, select=c(artist_id,tag_id,count.x))
+names(artist_tag) <- c("artist_id","tag_id","count")
+
+# make sure all tag names are UTF-8 compliant
+tags$tag <- iconv(tags$tag, "UTF-8", sub='')
+
+```
+  
+## Export Normalized Data to CSV  
+  
+```{r, eval=FALSE}
+# export data frames to working directory in csv format
+write.csv(user_df, "users.csv",row.names = FALSE)
+write.csv(artists, "artists.csv",row.names = FALSE)
+write.csv(user_artist, "user_artist.csv", row.names = FALSE)
+write.csv(artist_tag, "artist_tag.csv", row.names = FALSE)
+write.csv(tags, "tags.csv", row.names = FALSE)
+
+```
+
+# MySQL  
+  
+A word of caution:  the scripts in the previous sections require 5+ hours to execute.  Therefore, I am generating this Markdown document with csv files exported from a prior run of this file.  These csv files are saved in my Github repository.  
+
+**Retrive CSV Files from Gitub**  
+  
+```{r}
+myurl <-"https://raw.githubusercontent.com/spitakiss/Data607Final/master/csv_files.zip"
+download.file(myurl,destfile='csv_files.zip')
+unzip('csv_files.zip')
+```
+
+
+**Load CSV Tables into MySQL**
+```{r, eval=FALSE}
+# MySQL connection.  Using getPass() function to prompt user for username and password  
+my_db = dbConnect(MySQL(), user=getPass(msg = 'Enter username'), password= getPass('Enter Password'), dbname='lastfm_db')
+
+# load csv files into MySQL tables
+wd <- paste0(getwd(),"/")
+string_part1 <- 'LOAD DATA LOCAL INFILE \''
+string_part2 <- 'INTO TABLE '
+string_part3 <- 'FIELDS TERMINATED BY \',\'
+                    ENCLOSED BY \'"\'
+                    LINES TERMINATED BY \'\n\'
+                    IGNORE 1 ROWS;'
+
+paste_users <- paste0(string_part1, wd,'users','.csv\'',' ', string_part2, 'users'," ", string_part3)
+paste_artists <- paste0(string_part1, wd,'artists','.csv\'',' ', string_part2, 'artists'," ", string_part3)
+paste_user_artist <- paste0(string_part1, wd,'user_artist','.csv\'',' ', string_part2, 'user_artist'," ", string_part3)
+paste_artist_tag <-  paste0(string_part1, wd,'artist_tag','.csv\'',' ', string_part2, 'artist_tag'," ", string_part3) 
+paste_tags <- paste0(string_part1, wd,'tags','.csv\'',' ', string_part2, 'tags'," ", string_part3)  
+
+load_users <- dbGetQuery(my_db, paste_users) 
+load_artists <- dbGetQuery(my_db, paste_artists) 
+load_user_artist <- dbGetQuery(my_db, paste_user_artist) 
+load_artist_tag <- dbGetQuery(my_db, paste_artist_tag) 
+load_tags <- dbGetQuery(my_db, paste_tags) 
+
+
+test <- dbGetQuery(my_db, "SELECT * FROM users;")
+head(test)
+# db disconnect
+#dbDisconnect(my_db)
+
+```
+
+
+## Build Ratings Matrix  
+  
+```{r} 
+
+```
+  
+## References  
+- [Last.fm API documentation](http://www.last.fm/api):  This link provides ample documentation on how to sign up for an API key and use the many API methods available to access Last.fm data.  
+- [RLastFM package documentation](https://mkmanu.wordpress.com/2014/08/03/cluster-analysis-on-data-from-last-fm-a-tutorial-for-beginners-part-1/):  This website provides detail on where to download the `RLastFM` package and how to implement a variety of its built-in functions.  
+- Gorakala, Suresh K., and Michele Usuelli. *Building a recommendation system with R: learn the art of building robust and powerful recommendation engines using R*. Birmingham: Packt Publishing, 2015. Print.  
+This book provides detailed, mechanical details on how to implement a recommender system in R using the `recommenderlab` package.  The book is available on [Amazon.com](https://www.amazon.com/Building-Recommendation-System-Suresh-Gorakala/dp/1783554495/ref=sr_1_1?ie=UTF8&qid=1482076673&sr=8-1&keywords=building+a+recommendation+system+with+r).
