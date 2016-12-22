@@ -90,12 +90,12 @@ if (!require(RLastFM)) {
 }
 ```
   
-## Last.FM Data Pull  
+## Last.fm Data Pull  
   
-In this section, I retrieve relevant Last.fm data using functions from the `RLastFM` package, where possible.  The `RLastFM` library was built to connect with a previous build of the Last.fm API; so some of the package functions no longer work properly.  Also, the current build of the Last.fm API has new methods that cannot be accessed using `RLastFM`.  Finally, the available functions in this R package often do not allow the user full access to optional API method parameters.  For these reasons, I occassionaly used custom functions (in concert with the `jsonlite` package) to access the API data.   
+In this section, I retrieve relevant Last.fm data using functions from the `RLastFM` package, where possible.  The `RLastFM` library was built to connect with a previous build of the Last.fm API; so some of the package functions no longer work properly.  Also, the current build of the Last.fm API has new methods that cannot be accessed using `RLastFM`.  Finally, the available functions in this R package often do not allow the user full access to optional API method parameters.  For these reasons, I occasionally used custom functions (in concert with the `jsonlite` package) to access the API data.   
 
 ###Last.fm Usernames  
-In the prior build of the Last.fm API, there was an available method to retrieve Last.fm usernames associated with a particular artist.  Unfortunately, this method is no longer available.  To generate a list of usernames, I visited the [Last.fm artist webpage](http://www.last.fm/music/Andy+Shauf) for a musician that I currently follow, Andy Shauf.  The artist's page lists the usernames of top listeners.  Using just this username, I generated additional Last.fm usernames using the `user.getFriends` method.  A farily small can then be used to generate a sizeable vector of usernames.  
+In the prior build of the Last.fm API, there was an available method to retrieve Last.fm usernames associated with a particular artist.  Unfortunately, this method is no longer available.  To generate a list of usernames, I visited the [Last.fm artist webpage](http://www.last.fm/music/Andy+Shauf) for a musician that I currently follow, Andy Shauf.  The artist's page lists the usernames of top listeners.  Using just this username, I generated additional Last.fm usernames using the `user.getFriends` method.  A fairly small loop can then be used to generate a sizable vector of usernames.  
 
   
 ```{r, eval=FALSE}
@@ -169,7 +169,7 @@ user_df$user_nm <- iconv(user_df$user_nm, "UTF-8", sub='')
   
 In the following scripts, I pull artist information, such as artist name.  
 
-I also generate a dataframe with the top 100 artists listened to by each user for the last twelve months. 
+I also generate a data frame with the top 100 artists listened to by each user for the last twelve months. 
   
 ```{r, eval=FALSE}
 # function to retrive users' top artists
@@ -331,7 +331,7 @@ dbDisconnect(my_db)
   
 ###User Demographics  
   
-Let's begin by summarizing the number of Last.fm listenerings in our data set by country:   
+Let's begin by summarizing the number of Last.fm listeners in our data set by country:   
 
 ```{r, warning=FALSE, message=FALSE, comment=NA}
 # plot top 10 countries in data set, by numer of users, horizontal bar char
@@ -458,7 +458,8 @@ image(ratings_matrix[1:100, 1:100], main = "Visualization of Ratings Matrix")
 ###Pair Down Matrix  
 
 For faster computation and removal of possible bias in our models, I will pair down the ratings matrix as follows:  
-* First, only include artists that have been listend to by at least 10 users
+  
+* First, only include artists that have been listened to by at least 10 users  
 * Then exclude any users who have listened to fewer than 20 artists in the last 12 months.  
   
 Note:  There are more sophisticated, algorithmic techniques for removing bias, but they are beyond the scope of this project.  
@@ -591,7 +592,7 @@ Evaluate the accuracy of the model using:
   
 * root mean squared error  
 * mean square error  
-* mean absoluate error  
+* mean absolute error  
   
 ```{r, comment=NA}
 eval_reco <- Recommender(data = getData(eval_sets, "train"), method = "IBCF", parameter = NULL)
@@ -610,7 +611,7 @@ eval_accuracy
 
 ###UBCF Evaluation  
   
-Use the same measures to evalute the UBCF modl:  
+Use the same measures to evaluate the UBCF model:  
 ```{r, comment=NA}
 eval_reco <- Recommender(data = getData(eval_sets, "train"), method = "UBCF", parameter = NULL)
 # recommend 5 items
@@ -630,7 +631,7 @@ We see that the UBCF model outperforms the IBCF model for each of the three meas
   
 Finally, I will wrap up this project by recommending artists to myself, using my personal, Last.fm data:  
   
-In the scripts below, I retreive my listening history, and store in the proper realRatingsMatrix format.  Also, I output my top five artists in terms of play counts from the last 12 months.  
+In the scripts below, I retrieve my listening history, and store in the proper realRatingsMatrix format.  Also, I output my top five artists in terms of play counts from the last 12 months.  
 
 ```{r, comment=NA}
 
