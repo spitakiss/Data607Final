@@ -1,0 +1,727 @@
+---
+title: "Recommender Using Last.fm API"
+author: "Aaron Grzasko"
+date: "December 18, 2016"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+        code_folding: hide
+        theme: default
+        highlight: textmate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+  
+## Overview  
+  
+For this final Data 607 project, I build two recommender models using the `recommenderlab` R library:  
+
+1. An Item-Based Collaborative Filtering (IBCF) model  
+2. A User-Based Collaborative Filtering (UBCF) model 
+  
+The data for this project comes from Last.fm user listening history, and was accessed using the Last.fm API.  
+  
+In the sections below, I perform the following procedures:  
+  
+* Run scripts to pull Last.fm data  
+* Perform high-level exploratory analysis of the data set
+* Fit the two aforementioned models to training data  
+* Assess model fit using k-fold cross validation  
+* Make recommendations to myself, based on personal Last.fm user history  
+  
+  
+## Preliminary Notes  
+
+The scripts used to access the Last.fm API data required 5+ hours to execute.  For faster execution of this R Markdown document, I saved the data files from my API-related  work to my [Github account](https://github.com/spitakiss/Data607Final).  
+  
+To run the remaining code in this document, please follow these steps:  
+  
+* Download and unzip the zip file, `csv_files.zip`,from my Github account.  Save to your working directory.  
+  
+* Download the `loadlastfm.sql` file, and open in MySQL.  The scripts in this file create the database schema and load the csv files.  Make sure to change the directories referenced in the SQL document to your working directory before running.  
+* Keep your connection to MySQL server open and run the remaining code in this document.  
+
+ 
+Here are example scripts to retrieve Github documents:  
+
+```{r, eval = FALSE}
+  
+# set to your working directory
+setwd("C:/Users/Aaron/Google Drive/Documents/cuny/Data607/FinalProject/new2")
+ 
+# url for csv files
+myurl <-"https://raw.githubusercontent.com/spitakiss/Data607Final/master/csv_files.zip"
+
+# url for sql document
+myurl2 <- "https://raw.githubusercontent.com/spitakiss/Data607Final/master/loadlastfm.sql"
+
+# download and unzip files
+download.file(myurl,destfile='csv_files.zip')
+download.file(myurl2, destfile = 'loadlastfm.sql')
+unzip('csv_files.zip')
+```
+  
+## Load Libraries  
+  
+Note:  The package `RLastFM` must be manually downloaded and installed. Scripts are provided below to carryout this procedure.   
+```{r, eval=TRUE, message=FALSE, warning=FALSE}
+if (!require(XML)) {install.packages('XML');require(XML)}
+if (!require(wordcloud)) {install.packages('wordcloud');require(wordcloud)}
+if (!require(ggplot2)) {install.packages('ggplot2');require(ggplot2)}
+if (!require(rworldmap)) {install.packages('rworldmap');require(rworldmap)}
+if (!require(RCurl)) {install.packages('RCurl');require(RCurl)}
+if (!require(knitr)) {install.packages('knitr');require(knitr)}
+if (!require(recommenderlab)) {install.packages('recommenderlab');require(recommenderlab)}
+if (!require(jsonlite)) {install.packages('jsonlite');require(jsonlite)}
+if (!require(dplyr)) {install.packages('dplyr');require(dplyr)}
+if (!require(tidyr)) {install.packages('tidyr');require(tidyr)}
+if (!require(RMySQL)) {install.packages('RMySQL');require(RMySQL)}
+if (!require(getPass)) {install.packages('getPass');require(getPass)}
+if (!require(gridExtra)) {install.packages('gridExtra');require(gridExtra)}
+
+# manual install of RLastFM package
+if (!require(RLastFM)) {
+    download.file('http://cran.r-project.org/src/contrib/Archive/RLastFM/RLastFM_0.1-5.tar.gz','RLastFM_0.1-5.tar.gz')
+    install.packages('RLastFM_0.1-5.tar.gz', repos = NULL, type = "source")
+    require(RLastFM)
+}
+```
+  
+## Last.FM Data Pull  
+  
+In this section, I retrieve relevant Last.fm data using functions from the `RLastFM` package, where possible.  The `RLastFM` library was built to connect with a previous build of the Last.fm API; so some of the package functions no longer work properly.  Also, the current build of the Last.fm API has new methods that cannot be accessed using `RLastFM`.  Finally, the available functions in this R package often do not allow the user full access to optional API method parameters.  For these reasons, I occassionaly used custom functions (in concert with the `jsonlite` package) to access the API data.   
+
+###Last.fm Usernames  
+In the prior build of the Last.fm API, there was an available method to retrieve Last.fm usernames associated with a particular artist.  Unfortunately, this method is no longer available.  To generate a list of usernames, I visited the [Last.fm artist webpage](http://www.last.fm/music/Andy+Shauf) for a musician that I currently follow, Andy Shauf.  The artist's page lists the usernames of top listeners.  Using just this username, I generated additional Last.fm usernames using the `user.getFriends` method.  A farily small can then be used to generate a sizeable vector of usernames.  
+
+  
+```{r, eval=FALSE}
+
+# api key
+my_key <- "1ba315d4d1673bbf88aed473f1917306"
+
+# seed user name, based on manual review of artist, Andy Shauf's Last.fm webpage.
+user_nm <- c("nellsie")
+
+# function to append unique user names to maste vector.  This function implements the 
+# user.getFriends() method from RLastFM package. 
+ 
+append_friends <- function (x,y){
+    friends <- user.getFriends(x,key=my_key)$username
+    for (i in friends){
+        if (!(i %in% y)){
+            y <- append(y,i)
+        }
+    }
+    return(y)
+}
+
+# loop through friends, friends of friends, etc.
+for (i in 1:50){
+    user_nm <- append_friends(user_nm[i],user_nm)
+    Sys.sleep(0.2)
+}
+
+# create user data frame with unique user_id 
+user_id <- seq(1:length(user_nm))
+user_df <- data.frame(cbind(user_id,user_nm),stringsAsFactors=FALSE)
+```
+  
+### User demographics  
+
+Now, pull in relevant user demographics, and merge with prior user data frame.  
+
+```{r, eval=FALSE}
+
+# getInfo() function; not available in RLastFM package
+user.getInfo <- function(user, key=my_key){
+    base_url <- "http://ws.audioscrobbler.com/2.0/?method="
+    method <- "user.getinfo"
+    user_string <- "&user="
+    key_string <- "&api_key="
+    format_string <- "&format=json"
+    return (fromJSON(paste0(base_url,method, user_string,user,key_string,key,format_string)))
+}
+# data frame of demo data for all users
+demo_data <- data.frame(user_nm=character(),country = character(), ct = integer())
+for (name in user_df$user_nm){
+    temp <- user.getInfo(name)
+    temp_nm <- user_df$user_nm[which(user_df$user_nm==name)]
+    temp_country <- temp$user$country
+    temp_ct <- temp$user$playcount
+    temp_col <- cbind(user_nm = temp_nm,country=temp_country, ct = temp_ct)
+    demo_data <- rbind(demo_data, temp_col)
+    Sys.sleep(0.2)
+}
+
+# merge demo data with initial user data frame
+user_df <- inner_join(user_df,demo_data, by="user_nm")
+
+# make sure all user names are UTF-8 compliant
+user_df$user_nm <- iconv(user_df$user_nm, "UTF-8", sub='')
+
+```
+   
+### Artist Data  
+  
+In the following scripts, I pull artist information, such as artist name.  
+
+I also generate a dataframe with the top 100 artists listened to by each user for the last twelve months. 
+  
+```{r, eval=FALSE}
+# function to retrive users' top artists
+# Using custom function rather than RLastFM functon to obtain more refined results
+
+user.getTopArtistsMod <- function(user, key=my_key, period="12month", limit=100, page=1){
+    base_url <- "http://ws.audioscrobbler.com/2.0/?method="
+    method <- "user.gettopartists"
+    user_string <- "&user="
+    key_string <- "&api_key="
+    format_string <- "&format=json"
+    period_string <- "&period="
+    limit_string <- "&limit="
+    page_string <- "&page="
+    return (fromJSON(paste0(base_url,method, user_string,user,key_string,key,format_string,
+                            period_string, period,limit_string,limit,page_string,page)))
+} 
+
+# obtain user/top artist combinations
+user_artist <- data.frame(name = character(), playcount = integer(),mbid= character(), user_id = integer())
+for (name in user_df$user_nm){
+    temp <- user.getTopArtistsMod(name)$topartists$artist[c("name","playcount","mbid")]
+    temp$user_id <- user_df$user_id[user_df$user_nm == name]
+    user_artist <- rbind(user_artist,temp)
+    Sys.sleep(0.2)
+}
+
+
+# artists data frame
+artists <- unique(user_artist[c("name","mbid")])
+artist_id <- seq(1:nrow(artists)) 
+artists <- cbind(artists, artist_id)
+artists <- subset(artists,select=c(artist_id,name,mbid))
+
+# clean up user_artist dataframe for database export
+user_artist <-inner_join(user_artist, artists, by="name")
+user_artist <- subset(user_artist, select=c(user_id,artist_id,playcount))
+
+# getTopArtists API method sometimes (pretty rare) returns same artist twice for one user.
+# Code below cleans up duplicates  
+user_artist <- user_artist %>%
+    group_by(user_id, artist_id) %>%
+    summarise(playcount = sum(playcount))
+    
+
+
+# Make sure all artist names are UTF-8
+artists$name <- iconv(artists$name, "UTF-8", sub='')
+
+```
+
+### Artist Tag Data  
+  
+Artist tags are user-assigned descriptions of artists, e.g. "grunge", "1980s", or "krautrock."
+  
+```{r, eval=FALSE}
+# artist/tag combination data frame
+artist_tag <- data.frame(artist_id = integer(),tag = character(),count = integer() )
+
+
+# part 1: populate artist_tags data frame by matching on unique artist mbid (musicbrainz id), where available
+for (i in 1:nrow(artists)){
+    if (artists[i,]$mbid != ""){
+        temp <- tryCatch(artist.getTopTags(artist=NA, mbid=artists[i,]$mbid),error=function(e) NULL)
+        temp_tag <- temp$tag
+        temp_ct <- temp$count
+        temp_id <- rep(artists[i,]$artist_id,length(temp_tag))
+        temp_col <- data.frame( artist_id= temp_id, tag=temp_tag,count=temp_ct)
+        artist_tag <- rbind(temp_col, artist_tag)
+        Sys.sleep(0.2)
+    }
+    
+}   
+# unique artist_ids from part 1
+artist_unq <- unique(artist_tag$artist_id)
+
+# part 2: populate artist_tags by matching on artist name if no mbid or no match from previous step
+for (i in 1:nrow(artists)){
+    if (!(artists[i,]$artist_id %in% artist_unq)){
+        temp <- tryCatch(artist.getTopTags(artist=artists[i,]$name),error=function(e) NULL)
+        temp_tag <- temp$tag
+        temp_ct <- temp$count
+        temp_id <- rep(artists[i,]$artist_id,length(temp_tag))
+        temp_col <- data.frame( artist_id= temp_id, tag=temp_tag,count=temp_ct)
+        artist_tag <- rbind(temp_col, artist_tag)
+        Sys.sleep(0.2)
+    }
+    
+}   
+
+# clean up artist_tag table
+artist_tag$tag <- tolower(artist_tag$tag)
+artist_tag <- artist_tag %>%
+        group_by(artist_id,tag) %>%
+        summarise(count = sum(count))
+artist_tag <- data.frame(artist_tag)
+
+# unique tags data frame
+tags <- artist_tag %>%
+        group_by(tag) %>%
+        summarise(count = sum(count))
+tag_id <- seq(1:nrow(tags))
+tags$tag_id <- tag_id
+tags <- subset(tags, select=c(tag_id,tag,count)) 
+tags <- data.frame(tags)
+
+# prepare artist_tags data frame for database export
+artist_tag <- inner_join(artist_tag,tags, by="tag")
+artist_tag <- subset(artist_tag, select=c(artist_id,tag_id,count.x))
+names(artist_tag) <- c("artist_id","tag_id","count")
+
+# make sure all tag names are UTF-8 compliant
+tags$tag <- iconv(tags$tag, "UTF-8", sub='')
+
+```
+  
+## MySQL Data Retrieval  
+  
+Let's pull in the relevant data from our MySQL database:  
+  
+
+```{r, eval=TRUE, warning=FALSE, message=FALSE, comment=NA }
+# MySQL connection.  Using getPass() function to prompt user for username and password  
+my_db = dbConnect(MySQL(), user=getPass(msg = 'Enter username'), password= getPass('Enter Password'), 
+dbname='lastfm_db')
+
+
+# pull in user country data
+users <- dbGetQuery(my_db, "SELECT country, COUNT(*) AS country_ct
+                            FROM users
+                            GROUP BY country
+                            ORDER BY COUNT(*) DESC;")
+
+# retrieve most popular artist descriptive tags
+tags <- dbGetQuery(my_db, "SELECT tag_nm, ttl_tag_ct FROM tags
+                            ORDER BY ttl_tag_ct DESC
+                            LIMIT 200;")
+
+# pull user and artist playcount information, pull in artist name
+user_artist <- dbGetQuery(my_db, "SELECT user_id, artist_nm, user_artist.artist_id, artist_ct
+                                    FROM user_artist
+                                    INNER JOIN artists
+                                    ON user_artist.artist_id = artists.artist_id;")
+
+
+#user_artist <- dbGetQuery(my_db, "SELECT user_id, artist_id, artist_ct
+#                                    FROM user_artist;")
+                                    
+artists <- dbGetQuery(my_db, "SELECT artist_id, artist_nm
+                                    FROM artists;")
+
+
+# db disconnect
+dbDisconnect(my_db)
+
+```
+  
+## Exploratory Analysis  
+  
+###User Demographics  
+  
+Let's begin by summarizing the number of Last.fm listenerings in our data set by country:   
+
+```{r, warning=FALSE, message=FALSE, comment=NA}
+# plot top 10 countries in data set, by numer of users, horizontal bar char
+ggplot(top_n(users,10,country_ct) , aes(x=reorder(country, country_ct), y=country_ct, fill=country))+
+    geom_bar(stat = "identity")+
+    coord_flip() + labs(aes(x="country", y="user ct", colour=cond))+
+    ggtitle("Listeners by Country") 
+
+# plot on world map
+mapDevice('x11')
+map_data <- joinCountryData2Map(users, joinCode="NAME", nameJoinColumn="country")
+mapCountryData(map_data, nameColumnToPlot="country_ct", catMethod=c(1:5,6:25,26:50,51:150,151:300,301:507),
+    colourPalette = "terrain",mapTitle="Map of Last.fm Listeners by Country")
+
+
+```
+
+###Descriptive Tags for Artists  
+  
+Here are the top 200 most popular tags associated with artists in our data:  
+
+```{r, warning=FALSE, message=FALSE, comment=NA}
+# world cloud of top artist descriptive tags in our data set 
+
+set.seed(1)
+wordcloud(words = tags$tag_nm, freq = tags$ttl_tag_ct, min.freq = 20,
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+```
+
+###Most Popular Artists, No. Listeners 
+```{r}
+
+agg_ct_ua <- user_artist %>%
+    group_by(artist_nm) %>%
+    count(artist_nm) %>%
+    arrange(desc(n)) %>%
+    top_n(5, n)
+
+kable(agg_ct_ua)
+```
+<br>
+
+###Most Popular Artists, Total Play Count 
+```{r, echo}
+agg_sum_ua <- user_artist %>%
+    group_by(artist_nm) %>%
+    summarise(playct = sum(artist_ct)) %>%
+    arrange(desc(playct)) %>%
+    top_n(5, playct)
+
+kable(agg_sum_ua)
+```
+  
+###Distribution of Play Counts  
+In this project, I am using total number of artist play counts per user as an implicit rating variable.  Specifically, I am tracking each user's Last.fm history from the most recent 12 months.  
+  
+Let's look at summary description of the play count distribution per user/artist combination:  
+```{r, comment=NA}
+summary(user_artist$artist_ct)
+```
+Clearly, the distribution is incredibly right-skewed.  This is problematic, as our recommender models assume ratings per user are at least approximately normal.  One possible solution is to take the log transformation of the play counts.  Here is summary detail of the transformed data:  
+```{r, comment=NA}
+log_playct <- log(as.numeric(user_artist$artist_ct))
+summary(log_playct)
+```
+  
+Now, let's look at a before and after visual depiction of the log transformation:  
+```{r, warning=FALSE, message=FALSE}
+before <- qplot(user_artist$artist_ct, xlab="play ct") 
+after <-  qplot(log_playct, xlab = "log play ct") 
+grid.arrange(before, after, ncol=2)
+
+```  
+  
+The transformed data are slightly skewed, but the new distribution is a vast improvement over the raw play counts.  We will proceed without further modifications.     
+
+##Recommender Systems  
+  
+
+  
+###Reshape Data  
+  
+In the code below, I massage the data for use in the `recommenderlab` package.  I then output the dimensions (users x artists of the ratings matrix). 
+```{r, eval=TRUE, comment=NA}
+# pair down user_artist df, and prepare in matrix wide format
+
+ua_spread <- user_artist %>%
+    mutate(logplay = log(artist_ct)) %>%
+    select(user_id, artist_id, logplay) %>%
+    spread(artist_id, logplay)
+
+matrix_wide <- as.matrix(ua_spread[, 2:ncol(ua_spread)])
+rownames(matrix_wide) <- ua_spread$user_id
+
+# create realRatingMatrix, a data format used by recommenderlab
+ratings_matrix <- as(matrix_wide, "realRatingMatrix")
+ratings_matrix
+```
+  
+###Ratings Matrix Visuals 
+  
+In the plots below, we see that the number of listeners per artist, in many cases, is extremely low.  On the hand, most users listened to 100 artists, which was the maximum number pulled per user during the initial data pull using the Last.fm API.  
+  
+
+```{r, warning=FALSE, message=FALSE}
+# number artists listened to by users
+users_per_artist <- colCounts(ratings_matrix)
+upa_plot <- qplot(users_per_artist)
+
+# number of artists per listener
+artists_per_user <- rowCounts(ratings_matrix)
+apu_plot <- qplot(artists_per_user)
+grid.arrange(upa_plot, apu_plot, ncol=2)
+```
+
+Now let's examine the first 100 rows and 100 columns of the ratings matrix:  
+  
+```{r}
+image(ratings_matrix[1:100, 1:100], main = "Visualization of Ratings Matrix")
+```
+  
+###Pair Down Matrix  
+
+For faster computation and removal of possible bias in our models, I will pair down the ratings matrix as follows:  
+* First, only include artists that have been listend to by at least 10 users
+* Then exclude any users who have listened to fewer than 20 artists in the last 12 months.  
+  
+Note:  There are more sophisticated, algorithmic techniques for removing bias, but they are beyond the scope of this project.  
+  
+```{r, comment=NA}
+ratings_matrix_redux <- ratings_matrix[,colCounts(ratings_matrix) >= 10]
+ratings_matrix_redux <- ratings_matrix_redux[rowCounts(ratings_matrix_redux) >= 20]
+ratings_matrix_redux
+```
+
+### Define Training Data  
+```{r, comment=NA}
+set.seed(1)
+train_boolean <- sample(x = c(TRUE,FALSE), size = nrow(ratings_matrix_redux),replace=TRUE, prob = c(0.8,0.2))
+training_data <- ratings_matrix_redux[train_boolean,]
+test_data <- ratings_matrix_redux[!train_boolean,]
+```
+  
+Training data dimensions:  
+```{r, comment=NA}
+training_data
+
+```
+  
+Test data dimensions:  
+  
+```{r, comment=NA}
+test_data
+```
+  
+### IBCF Model  
+
+Fit model:    
+```{r, comment=NA}
+recmodel_ibcf <- Recommender(data=training_data, method="IBCF", parameter = list(k=30))
+recmodel_ibcf
+```  
+
+Find artists that are similar to many other artists:  
+```{r, warning=FALSE, message=FALSE, comment=NA}
+model_details <- getModel(recmodel_ibcf)
+col_sums <- colSums(model_details$sim > 0)
+
+# top 5 artists with highest number of similarities to other artists
+top_artists <- head(sort(col_sums, decreasing =  TRUE),5)
+
+
+# display top 5 
+display_top <- subset(artists, artist_id %in% names(top_artists), select=c(artist_nm))
+row.names(display_top) <- NULL
+display_top
+```
+
+Find most recommended items in the test data set:  
+```{r, comment=NA}
+# recommendations per user
+num_rec <- 5
+
+# predict
+rec_predict <- predict(object = recmodel_ibcf, newdata = test_data, n = num_rec)
+rec_predict
+
+# define recommendation vector
+rec_vector <- integer()
+for (i in 1:length(rec_predict)){
+    rec_vector <- append(rec_vector, rec_predict@items[[i]])
+}
+
+# most recommended artists
+most_rec <- head(sort(table(rec_vector), decreasing=TRUE),5)
+
+display_top <- subset(artists, artist_id %in% names(most_rec), select = c(artist_nm))
+row.names(display_top) <- NULL
+display_top
+```
+   
+### UBCF Model  
+  
+Fit model:  
+```{r, comment=NA}
+recmodel_ubcf <- Recommender(data=training_data, method="UBCF")
+recmodel_ubcf
+```
+  
+
+Find most recommended items in the test data set:  
+```{r, comment=NA}
+# recommendations per user
+num_rec <- 5
+
+# predict
+rec_predict <- predict(object = recmodel_ubcf, newdata = test_data, n = num_rec)
+rec_predict
+
+# define recommendation vector
+rec_vector <- integer()
+for (i in 1:length(rec_predict)){
+    rec_vector <- append(rec_vector, rec_predict@items[[i]])
+}
+
+# most recommended artists
+most_rec <- head(sort(table(rec_vector), decreasing=TRUE),5)
+
+display_top <- subset(artists, artist_id %in% names(most_rec), select = c(artist_nm))
+row.names(display_top) <- NULL
+display_top
+```  
+   
+## Evaluate Models  
+  
+Set up evaluation model:
+```{r, comment=NA}
+
+# k folds
+n_fold <- 4
+
+# must be lower than 20, our minimun specified number of artists per user 
+items_to_keep <- 15
+
+# set ratings threshold to mean of user ratings, somewhat arbitrary
+rating_threshold <- mean(rowMeans(ratings_matrix_redux))
+
+eval_sets <- evaluationScheme(data = ratings_matrix_redux, method = "cross-validation",
+                              k = n_fold, given = items_to_keep, goodRating = rating_threshold)
+```
+
+### IBCF Evaluation  
+  
+Evaluate the accuracy of the model using:  
+  
+* root mean squared error  
+* mean square error  
+* mean absoluate error  
+  
+```{r, comment=NA}
+eval_reco <- Recommender(data = getData(eval_sets, "train"), method = "IBCF", parameter = NULL)
+
+# recommend 5 items
+items_to_rec <- 5
+eval_pred <- predict(object = eval_reco, newdata = getData(eval_sets, "known"), n = items_to_rec,
+                     type = "ratings")
+
+# determine model accuracy
+eval_accuracy <- calcPredictionAccuracy(x = eval_pred, data=getData(eval_sets,"unknown"), byUser=FALSE)
+
+eval_accuracy
+
+```
+
+###UBCF Evaluation  
+  
+Use the same measures to evalute the UBCF modl:  
+```{r, comment=NA}
+eval_reco <- Recommender(data = getData(eval_sets, "train"), method = "UBCF", parameter = NULL)
+# recommend 5 items
+items_to_rec <- 5
+eval_pred <- predict(object = eval_reco, newdata = getData(eval_sets, "known"), n = items_to_rec,
+                     type = "ratings")
+
+# determine model accuracy
+eval_accuracy <- calcPredictionAccuracy(x = eval_pred, data=getData(eval_sets,"unknown"), byUser=FALSE)
+
+eval_accuracy
+```
+  
+We see that the UBCF model outperforms the IBCF model for each of the three measures.  
+  
+## Personal Recommendations
+  
+Finally, I will wrap up this project by recommending artists to myself, using my personal, Last.fm data:  
+  
+In the scripts below, I retreive my listening history, and store in the proper realRatingsMatrix format.  Also, I output my top five artists in terms of play counts from the last 12 months.  
+
+```{r, comment=NA}
+
+# pull information using Last.fm API
+my_key <- "1ba315d4d1673bbf88aed473f1917306"
+user.getTopArtistsMod <- function(user, key=my_key, period="12month", limit=100, page=1){
+    base_url <- "http://ws.audioscrobbler.com/2.0/?method="
+    method <- "user.gettopartists"
+    user_string <- "&user="
+    key_string <- "&api_key="
+    format_string <- "&format=json"
+    period_string <- "&period="
+    limit_string <- "&limit="
+    page_string <- "&page="
+    return (fromJSON(paste0(base_url,method, user_string,user,key_string,key,format_string,
+                            period_string, period,limit_string,limit,page_string,page)))
+} 
+
+# massage data into appropriate form for realRatingsmatrix
+my_artists <- user.getTopArtistsMod('spitakiss')$topartists$artist[c("name","playcount","mbid")]
+my_artists$playcount <- as.integer(my_artists$playcount)
+names(my_artists) <- c("artist_nm","playcount","mbid")
+
+# display my top artists in last 12 months:  
+
+my_artists %>%
+    select(artist_nm,playcount) %>%
+    arrange(desc(playcount)) %>%
+    top_n(5,playcount)
+
+# perform additonal manipulations to get data in proper matrix format
+my_artists <- my_artists %>%
+        inner_join(artists, by="artist_nm") %>%
+        select(artist_id, playcount)
+    
+rating_columns <- data.frame(as.integer(colnames(ratings_matrix_redux)))
+names(rating_columns) <- "artist_id"
+
+my_artists <- left_join(rating_columns, my_artists, by="artist_id")
+my_artists <-  my_artists %>%
+    spread(artist_id,playcount)
+
+matrix_wide <- as.matrix(my_artists)
+my_ratings_matrix <- as(matrix_wide, "realRatingMatrix")
+
+
+```
+
+Predictions from IBCF model:  
+```{r, comment=NA}
+rec_predict <- predict(object = recmodel_ibcf, newdata = my_ratings_matrix, n = num_rec)
+rec_vector <- rec_predict@items[[1]]
+
+rec_vector <- integer()
+for (i in 1:length(rec_predict)){
+    rec_vector <- append(rec_vector, rec_predict@items[[i]])
+}
+
+# my recommended artists, IBCF
+most_rec <- sort(table(rec_vector), decreasing=TRUE)
+display_top <- subset(artists, artist_id %in% names(most_rec), select=artist_nm)
+rownames(display_top) <- NULL
+display_top  
+```
+  
+Predictions from UBCF model:  
+```{r, comment=NA}
+rec_predict <- predict(object = recmodel_ubcf, newdata = my_ratings_matrix, n = num_rec)
+rec_vector <- rec_predict@items[[1]]
+
+rec_vector <- integer()
+for (i in 1:length(rec_predict)){
+    rec_vector <- append(rec_vector, rec_predict@items[[i]])
+}
+
+# my recommended artists, UBCF
+most_rec <- sort(table(rec_vector), decreasing=TRUE)
+display_top <- subset(artists, artist_id %in% names(most_rec), select=artist_nm)
+rownames(display_top) <- NULL
+display_top  
+
+``` 
+
+## References  
+- [Last.fm API documentation](http://www.last.fm/api):  This link provides ample documentation on how to sign up for an API key and use the many API methods available to access Last.fm data.  
+- [RLastFM package documentation](https://mkmanu.wordpress.com/2014/08/03/cluster-analysis-on-data-from-last-fm-a-tutorial-for-beginners-part-1/):  This website provides detail on where to download the `RLastFM` package and how to implement a variety of its built-in functions.  
+- [Machine Learning with R book](https://www.amazon.com/Building-Recommendation-System-Suresh-Gorakala/dp/1783554495/ref=sr_1_1?ie=UTF8&qid=1482076673&sr=8-1&keywords=building+a+recommendation+system+with+r)  
+Gorakala, Suresh K., and Michele Usuelli. *Building a recommendation system with R: learn the art of building robust and powerful recommendation engines using R*. Birmingham: Packt Publishing, 2015. Print.  
+This text provides detailed, mechanical details on how to implement a recommender system in R using the `recommenderlab` package.  I relied on this book heavily for both fitting and evaluating the two recommender models.     
+- [Word Clouds in R](http://www.sthda.com/english/wiki/text-mining-and-word-cloud-fundamentals-in-r-5-simple-steps-you-should-know):  Basic how-to.
+- [rworldmap documentation](http://stackoverflow.com/questions/24136868/plot-map-with-values-for-countries-as-color-in-r): from stackoverflow.  
+
+
+
